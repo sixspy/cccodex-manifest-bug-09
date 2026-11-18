@@ -8,9 +8,11 @@ from app.config import Config
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or Config.database()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发写时排队等锁而不是立刻抛 SQLITE_BUSY，保证登记/闭合串行化
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -18,6 +20,26 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 def get_db(db_path: str | None = None):
     conn = connect(db_path)
     try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def locked_write(db_path: str | None = None):
+    """立即写事务：BEGIN IMMEDIATE 抢库写锁。
+
+    登记与闭合共用这把锁。事务内读到的批次态即本次判定的唯一依据
+    （读态来源：提交瞬间库内最新批次态），门槛与批次态同源，
+    并发“灌数 vs 闭合”在此串行化，杜绝已闭合批双写新对象。
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:
@@ -73,10 +95,32 @@ CREATE TABLE IF NOT EXISTS visibility_reports (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS dedup_scans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  as_of_date TEXT NOT NULL,
+  eligible_count INTEGER NOT NULL,
+  duplicate_group_count INTEGER NOT NULL,
+  rejected_row_count INTEGER NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- 存储层兜底：可登记门槛与批次态同源（同库同一条批次行）。
+-- 仅“收集中”批允许写入新的“已登记”对象；已闭合/已作废批一律拒写，应用层漏判也拦得住。
+-- 闭合流程只做 UPDATE、种子数据写“已闭合”行，均不受此 INSERT 触发器限制。
+CREATE TRIGGER IF NOT EXISTS trg_landing_objects_gate
+BEFORE INSERT ON landing_objects
+WHEN
+  NEW.status = '已登记'
+  AND (SELECT status FROM landing_batches WHERE id = NEW.batch_id) != '收集中'
+BEGIN
+  SELECT RAISE(ABORT, '批次非收集中，禁止登记新对象（读态来源：提交瞬间库内批次态）');
+END;
 """
 
 SEED_BATCHES = [

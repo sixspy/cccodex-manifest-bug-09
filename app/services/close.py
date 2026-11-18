@@ -1,9 +1,10 @@
-from app.db import get_db
+from app.db import locked_write
 from app.services.objects import ServiceError
 
 
 def close_batch(batch_id: int, db_path: str | None = None) -> dict:
-    with get_db(db_path) as conn:
+    # 与登记共用立即写锁：闭合持锁期间任何登记都排队，锁内读到“已闭合”即被拒
+    with locked_write(db_path) as conn:
         batch = conn.execute(
             "SELECT * FROM landing_batches WHERE id=?", (batch_id,)
         ).fetchone()

@@ -12,13 +12,16 @@ from app.db import init_db
 from app.services import (
     close_batch,
     get_batch,
+    get_scan,
     list_batches,
     list_objects,
     list_reports,
+    list_scans,
     register_object,
+    run_scan,
     run_visibility,
 )
-from app.services.objects import ServiceError
+from app.services.objects import READ_SOURCE, ServiceError
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -126,7 +129,19 @@ async def api_batch_detail(request: Request, batch_id: int) -> dict:
     batch = get_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
-    return {"batch": batch, "objects": list_objects(batch_id)}
+    # 门槛与批次态同源：页面据此渲染可登记/拒登态，真正拦截仍以提交瞬间服务端读态为准
+    gate = {
+        "read_source": READ_SOURCE,
+        "register_allowed": batch["status"] == "收集中",
+        "batch_status": batch["status"],
+    }
+    if batch["status"] == "已闭合":
+        gate["reason"] = "BATCH_CLOSED"
+        gate["message"] = "批次已闭合，拒绝登记新对象"
+    elif batch["status"] != "收集中":
+        gate["reason"] = "BATCH_VOID"
+        gate["message"] = "批次已作废，拒绝登记新对象"
+    return {"batch": batch, "objects": list_objects(batch_id), "register_gate": gate}
 
 
 @post("/api/batches/{batch_id:int}/objects")
@@ -141,8 +156,14 @@ async def api_register(request: Request, batch_id: int) -> Response:
             int(body.get("byte_size", 0)),
         )
     except ServiceError as exc:
+        # 短句 + 拒因码 + 读态来源：登记详情与扫库台展示同一拒因
+        content = {"ok": False, "error": exc.message}
+        if exc.reason:
+            content["reason"] = exc.reason
+        if exc.read_source:
+            content["read_source"] = exc.read_source
         return Response(
-            content={"ok": False, "error": exc.message},
+            content=content,
             status_code=exc.status_code,
             media_type="application/json",
         )
@@ -189,6 +210,33 @@ async def api_run_report(request: Request) -> dict:
     )
 
 
+@get("/api/dedup-scans")
+async def api_scans(request: Request) -> dict:
+    require_user(request)
+    return {"items": list_scans()}
+
+
+@get("/api/dedup-scans/{scan_id:int}")
+async def api_scan_detail(request: Request, scan_id: int) -> dict:
+    require_user(request)
+    scan = get_scan(scan_id)
+    if not scan:
+        raise HTTPException(status_code=404, detail="扫库记录不存在")
+    return {"scan": scan}
+
+
+@post("/api/dedup-scans")
+async def api_run_scan(request: Request) -> Response:
+    require_user(request)
+    body = await request.json()
+    scan = run_scan(str(body.get("as_of_date", "2026-11-16")))
+    return Response(
+        content={"ok": True, "scan": scan},
+        status_code=200,
+        media_type="application/json",
+    )
+
+
 app = Litestar(
     route_handlers=[
         root,
@@ -203,6 +251,9 @@ app = Litestar(
         api_close,
         api_reports,
         api_run_report,
+        api_scans,
+        api_scan_detail,
+        api_run_scan,
         create_static_files_router(path="/static", directories=[str(STATIC)]),
     ],
     on_startup=[_on_startup],
